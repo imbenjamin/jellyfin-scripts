@@ -1,5 +1,5 @@
 # jellyfin-scripts
-Collection of scripts I use for Jellyfin / media management
+Collection of scripts I use for Jellyfin / media management on macOS
 
 - convert_4k_to_1080p
   - Scans a directory (or a single file) for a 4K HEVC MKV file and creates a 1080p AVC MKV copy.
@@ -10,3 +10,7 @@ Collection of scripts I use for Jellyfin / media management
   - Ensures the Dolby Vision profile is Profile 8.1.
   - Converts a HDR10+ base layer to regular HDR10 (as per standard)
   - **Useful for ensuring compatibility with touchy devices like LG webOS TVs.**
+
+## Disclaimer
+These scripts havebeen heavily produced by Claude AI. They have been used and tested in my own environment and use case, and I accept no responsibility for the quality of output or usefulness in your own environment. **Review and understand the scripts before running yourself!** There are dry-run modes included in the scripts to preview the changes before running live.
+**USE AT YOUR OWN RISK.**
