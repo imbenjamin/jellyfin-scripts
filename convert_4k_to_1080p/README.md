@@ -74,3 +74,68 @@ unavailable or fails to initialise for a given file.
   `./convert_4k_to_1080p.sh -s /Volumes/NAS/Movies   # force software`
 
   `./convert_4k_to_1080p.sh -n /Volumes/NAS/Movies   # dry-run`
+
+## Example Output:
+(Shortened for brevity)
+
+`./convert_4k_to_1080p.sh movies`
+
+```
+
+╔══════════════════════════════════════════════════════════╗
+║        4K HEVC -> 1080p AVC Batch Converter              ║
+║              Apple VideoToolbox Edition                  ║
+╚══════════════════════════════════════════════════════════╝
+
+  Input         : movies
+  Output dir    : <same as source>
+  HW decode     : VideoToolbox (-hwaccel videotoolbox)
+  HW encode     : h264_videotoolbox (8000k)
+  SW fallback   : libx264 crf=18 preset=slow
+  Tone-map      : mobius via zscale
+  Dry-run       : false
+
+Scanning 114 MKV file(s)...
+
+  SKIP  (not 4K HEVC) -> movies/1408 (2007).mkv
+  SKIP  (not 4K HEVC) -> movies/Amadeus (1984).mkv
+  SKIP  (not 4K HEVC) -> movies/Apollo 13 (1995).mkv
+
+[1] Found 4K HEVC: movies/Avatar - Fire and Ash (2025).mkv
+  HDR detected — hybrid: VT HW decode -> CPU tone-map (mobius) -> VT HW encode
+  Output : movies/Avatar - Fire and Ash (2025) - 1080p.mkv
+  Pipeline : HW-hybrid (VT decode + CPU tone-map + VT encode)
+  Converting...
+frame=281641 fps= 36 q=-0.0 Lsize=12661088KiB time=03:17:08.89 bitrate=8768.3kbits/s dup=0 drop=2252 speed=1.53x elapsed=2:08:51.88    
+  Done [HW-hybrid (VT decode + CPU tone-map + VT encode)]
+
+  SKIP  (not 4K HEVC) -> movies/Bill & Ted Face the Music (2020).mkv
+  SKIP  (not 4K HEVC) -> movies/Bill & Ted's Bogus Journey (1991).mkv
+  SKIP  (not 4K HEVC) -> movies/Bill & Ted's Excellent Adventure (1989).mkv
+
+[2] Found 4K HEVC: movies/Captain Phillips (2013).mkv
+  HDR detected — hybrid: VT HW decode -> CPU tone-map (mobius) -> VT HW encode
+  Output : movies/Captain Phillips (2013) - 1080p.mkv
+  Pipeline : HW-hybrid (VT decode + CPU tone-map + VT encode)
+  Converting...
+frame=192887 fps= 38 q=-0.0 Lsize=10648138KiB time=02:14:04.95 bitrate=10842.8kbits/s speed=1.57x elapsed=1:25:18.30    
+  Done [HW-hybrid (VT decode + CPU tone-map + VT encode)]
+
+[3] Found 4K HEVC: movies/Casino Royale (2006).mkv
+  HDR detected — hybrid: VT HW decode -> CPU tone-map (mobius) -> VT HW encode
+  Output : movies/Casino Royale (2006) - 1080p.mkv
+  Pipeline : HW-hybrid (VT decode + CPU tone-map + VT encode)
+  Converting...
+frame=192887 fps= 38 q=-0.0 Lsize=10648138KiB time=02:14:04.95 bitrate=10842.8kbits/s speed=1.57x elapsed=1:25:18.30    
+  Done [HW-hybrid (VT decode + CPU tone-map + VT encode)]
+
+
+========================================
+Summary
+  4K HEVC files found : 15
+  Converted           : 15
+  Errors              : 0
+  Skipped             : 99
+========================================
+
+```
