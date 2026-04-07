@@ -30,9 +30,9 @@
 #   • mkvmerge / mkvextract          (brew install mkvtoolnix)
 #
 # Usage:
-#   chmod +x convert_to_dv81.sh
-#   ./convert_to_dv81.sh /path/to/media/dir [--dry-run] [--overwrite]
-#   ./convert_to_dv81.sh /path/to/file.mkv [--dry-run] [--overwrite]
+#   chmod +x convert_to_dv81_hdr10only.sh
+#   ./convert_to_dv81_hdr10only.sh /path/to/media/dir [--dry-run] [--overwrite]
+#   ./convert_to_dv81_hdr10only.sh /path/to/file.mkv [--dry-run] [--overwrite]
 #
 # Options:
 #   --dry-run   Print what would be converted without actually converting.
