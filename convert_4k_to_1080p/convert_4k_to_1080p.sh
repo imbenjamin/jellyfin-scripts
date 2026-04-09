@@ -6,26 +6,42 @@
 # converts them to 1080p HD AVC (H.264) MKV files with HDR→SDR tone mapping.
 # Audio and subtitle tracks are copied without modification.
 #
-# Hardware acceleration: Apple VideoToolbox (macOS) is used by default for
-# both decoding (hevc_videotoolbox) and encoding (h264_videotoolbox).
-# HDR tone-mapping is performed in software (CPU) as VideoToolbox does not
-# support it natively; the script automatically uses a hybrid pipeline
-# (HW decode → CPU tone-map/scale → HW encode) for HDR sources and a
-# fully hardware pipeline for SDR sources.
-# Falls back to software (libx264) automatically if VideoToolbox is
-# unavailable or fails to initialise for a given file.
+# Hardware acceleration: Apple VideoToolbox (macOS) is used for all pipelines.
+# The script automatically selects the best available tier at startup:
+#
+#   Tier 1 - Full GPU (jellyfin-ffmpeg required):
+#     All processing stays on the GPU. HEVC decoded via VideoToolbox, HDR->SDR
+#     tone-mapping performed by tonemap_videotoolbox (Apple Metal compute
+#     shaders), scaled via scale_vt, and encoded by h264_videotoolbox.
+#
+#   Tier 2 - Hybrid GPU/CPU (evermeet.cx static ffmpeg or jellyfin-ffmpeg):
+#     VideoToolbox HW decode and encode, with CPU-side HDR->SDR tone-mapping
+#     via zscale + tonemap (libzimg). Frames are transferred from GPU to CPU
+#     for tone-mapping then back to GPU for encoding.
+#
+#   Tier 3 - Software fallback (automatic):
+#     Used if VideoToolbox fails to initialise for a given file. Full software
+#     pipeline using libx264 with CPU zscale+tonemap tone-mapping.
 #
 # Requirements:
-#   - ffmpeg + ffprobe: static builds from https://evermeet.cx/ffmpeg/
-#     These include VideoToolbox, libx264, libzimg (zscale), and all
-#     required filters. The standard Homebrew ffmpeg does NOT include
-#     libzimg/zscale and will not work for HDR tone-mapping.
+#   ffmpeg + ffprobe — the script checks for binaries in this priority order:
 #
-#     Install:
-#       curl -L https://evermeet.cx/ffmpeg/get/zip -o ffmpeg.zip && unzip ffmpeg.zip
-#       curl -L https://evermeet.cx/ffmpeg/get/ffprobe/zip -o ffprobe.zip && unzip ffprobe.zip
-#       sudo mv ffmpeg ffprobe /usr/local/bin/
-#       sudo xattr -d com.apple.quarantine /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
+#   1. jellyfin-ffmpeg (preferred — enables full GPU tone-mapping via
+#      tonemap_videotoolbox / Metal, which standard ffmpeg builds lack):
+#        /usr/lib/jellyfin-ffmpeg/ffmpeg
+#        /Applications/Jellyfin.app/Contents/MacOS/ffmpeg
+#      Install: https://github.com/jellyfin/jellyfin-ffmpeg/releases
+#
+#   2. evermeet.cx static build (fallback — CPU tone-mapping via zscale,
+#      HW encode/decode still active via VideoToolbox):
+#        https://evermeet.cx/ffmpeg/
+#        curl -L https://evermeet.cx/ffmpeg/get/zip -o ffmpeg.zip && unzip ffmpeg.zip
+#        curl -L https://evermeet.cx/ffmpeg/get/ffprobe/zip -o ffprobe.zip && unzip ffprobe.zip
+#        sudo mv ffmpeg ffprobe /usr/local/bin/
+#        sudo xattr -d com.apple.quarantine /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
+#
+#   The standard Homebrew ffmpeg lacks both tonemap_videotoolbox and zscale
+#   and will not work for HDR tone-mapping.
 #
 #   - macOS 10.13+ (VideoToolbox HEVC decode requires Metal/macOS 10.13+)
 #
@@ -51,6 +67,11 @@
 #   -k <val>    Peak brightness for tone-mapping in nits (default: omitted,
 #               letting ffmpeg auto-detect from source metadata)
 #               Example: -k 1000 for a 1000-nit mastered source
+#   -l <nits>   Nominal peak luminance of the SDR output display in nits
+#               (default: 100). Raise this if the output appears overbright;
+#               values of 150-250 suit most modern displays. Higher values
+#               give the tone-mapper more headroom, reducing highlight clipping.
+#               Example: -l 203 (reference white for HDR displays)
 #   -s          Force software encode only (skip VideoToolbox entirely)
 #   -n          Dry-run: detect files and print commands without converting
 #   -h          Show this help message
@@ -71,6 +92,7 @@ SW_CRF=18
 SW_PRESET="slow"
 TONEMAP="mobius"
 TONEMAP_PEAK=""
+TONEMAP_NPL=100
 FORCE_SW=false
 DRY_RUN=false
 OUTPUT_DIR=""
@@ -88,7 +110,7 @@ usage() {
     exit 0
 }
 
-while getopts ":o:b:c:p:t:k:snh" opt; do
+while getopts ":o:b:c:p:t:k:l:snh" opt; do
     case $opt in
         o) OUTPUT_DIR="$OPTARG" ;;
         b) VT_BITRATE="$OPTARG" ;;
@@ -96,6 +118,7 @@ while getopts ":o:b:c:p:t:k:snh" opt; do
         p) SW_PRESET="$OPTARG" ;;
         t) TONEMAP="$OPTARG" ;;
         k) TONEMAP_PEAK="$OPTARG" ;;
+        l) TONEMAP_NPL="$OPTARG" ;;
         s) FORCE_SW=true ;;
         n) DRY_RUN=true ;;
         h) usage ;;
@@ -134,44 +157,85 @@ fi
 
 # OUTPUT_DIR remains empty by default — each file is written alongside its source
 
-# Dependency checks
-for cmd in ffmpeg ffprobe; do
-    if ! command -v "$cmd" &>/dev/null; then
-        echo -e "${RED}Error: '$cmd' not found.${RESET}" >&2
-        echo -e "${RED}Download the static build from: https://evermeet.cx/ffmpeg/${RESET}" >&2
-        exit 1
+# ── Binary resolution ────────────────────────────────────────────────────────
+# Prefer jellyfin-ffmpeg (has tonemap_videotoolbox / Metal GPU tone-mapping).
+# Fall back to whatever ffmpeg/ffprobe is on PATH (e.g. evermeet.cx build).
+JELLYFIN_FFMPEG_CANDIDATES=(
+    "/usr/lib/jellyfin-ffmpeg/ffmpeg"
+    "/Applications/Jellyfin.app/Contents/MacOS/ffmpeg"
+)
+FFMPEG_BIN=""
+FFPROBE_BIN=""
+
+for candidate in "${JELLYFIN_FFMPEG_CANDIDATES[@]}"; do
+    if [[ -x "$candidate" ]]; then
+        FFMPEG_BIN="$candidate"
+        # ffprobe lives alongside ffmpeg in the same directory
+        FFPROBE_BIN="$(dirname "$candidate")/ffprobe"
+        # If jellyfin-ffmpeg ships without a separate ffprobe, fall back to PATH
+        if [[ ! -x "$FFPROBE_BIN" ]]; then
+            FFPROBE_BIN="$(command -v ffprobe 2>/dev/null || true)"
+        fi
+        break
     fi
 done
 
+# Fall back to PATH binaries if no jellyfin-ffmpeg found
+if [[ -z "$FFMPEG_BIN" ]]; then
+    FFMPEG_BIN="$(command -v ffmpeg 2>/dev/null || true)"
+    FFPROBE_BIN="$(command -v ffprobe 2>/dev/null || true)"
+fi
+
+if [[ -z "$FFMPEG_BIN" || ! -x "$FFMPEG_BIN" ]]; then
+    echo -e "${RED}Error: ffmpeg not found.${RESET}" >&2
+    echo -e "${RED}Install jellyfin-ffmpeg: https://github.com/jellyfin/jellyfin-ffmpeg/releases${RESET}" >&2
+    echo -e "${RED}Or the evermeet.cx static build: https://evermeet.cx/ffmpeg/${RESET}" >&2
+    exit 1
+fi
+if [[ -z "$FFPROBE_BIN" || ! -x "$FFPROBE_BIN" ]]; then
+    echo -e "${RED}Error: ffprobe not found alongside ffmpeg at '$FFMPEG_BIN'.${RESET}" >&2
+    exit 1
+fi
+
+# Alias functions so the rest of the script calls ffmpeg/ffprobe transparently
+ffmpeg()  { "$FFMPEG_BIN"  "$@"; }
+ffprobe() { "$FFPROBE_BIN" "$@"; }
+
 # ── Capability Detection ──────────────────────────────────────────────────────
-# VideoToolbox HW decode is enabled via -hwaccel videotoolbox (no separate
-# decoder binary — the standard hevc decoder is used, accelerated by VT).
-# We probe by attempting a 1-frame null decode with -hwaccel videotoolbox.
+# Probe capabilities of the resolved binary at startup.
 HW_DECODE_AVAILABLE=false
 HW_ENCODE_AVAILABLE=false
+HW_TONEMAP_AVAILABLE=false   # tonemap_videotoolbox (jellyfin-ffmpeg only)
 ZSCALE_AVAILABLE=false
 
 if ! $FORCE_SW; then
-    # Probe HW decode: try a null decode with -hwaccel videotoolbox
-    if ffmpeg -hide_banner -hwaccel videotoolbox \
+    # Probe HW decode via -hwaccel videotoolbox
+    if "$FFMPEG_BIN" -hide_banner -hwaccel videotoolbox \
               -f lavfi -i nullsrc=s=16x16:d=0.1 \
               -c:v hevc -frames:v 1 -f null - 2>/dev/null; then
         HW_DECODE_AVAILABLE=true
     fi
     # Probe HW encode
-    if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q "h264_videotoolbox"; then
+    if "$FFMPEG_BIN" -hide_banner -encoders 2>/dev/null | grep -q "h264_videotoolbox"; then
         HW_ENCODE_AVAILABLE=true
+    fi
+    # Probe tonemap_videotoolbox (Metal GPU tone-mapping, jellyfin-ffmpeg only)
+    if "$FFMPEG_BIN" -hide_banner -filters 2>/dev/null | grep -qF "tonemap_videotoolbox"; then
+        HW_TONEMAP_AVAILABLE=true
     fi
 fi
 
-# Probe zscale — required for HDR->SDR tone-mapping (needs libzimg)
-if ffmpeg -hide_banner -filters 2>/dev/null | grep -qF " zscale "; then
+# Probe zscale — required for CPU HDR->SDR tone-mapping (needs libzimg)
+if "$FFMPEG_BIN" -hide_banner -filters 2>/dev/null | grep -qF " zscale "; then
     ZSCALE_AVAILABLE=true
-else
-    # Warn now; we will abort later if an HDR file is actually encountered
-    echo -e "${YELLOW}Warning: zscale filter not found in this ffmpeg build.${RESET}" >&2
-    echo -e "${YELLOW}         HDR->SDR tone-mapping will not be available.${RESET}" >&2
-    echo -e "${YELLOW}         Download the static build from: https://evermeet.cx/ffmpeg/${RESET}" >&2
+fi
+
+# Warn if neither GPU nor CPU tone-mapping is available
+if ! $HW_TONEMAP_AVAILABLE && ! $ZSCALE_AVAILABLE; then
+    echo -e "${YELLOW}Warning: neither tonemap_videotoolbox nor zscale found in:${RESET}" >&2
+    echo -e "${YELLOW}         $FFMPEG_BIN${RESET}" >&2
+    echo -e "${YELLOW}         HDR files will be skipped.${RESET}" >&2
+    echo -e "${YELLOW}         Install jellyfin-ffmpeg or the evermeet.cx static build.${RESET}" >&2
     echo "" >&2
 fi
 
@@ -246,14 +310,20 @@ has_hdr() {
 #   is needed — the standard hevc decoder runs accelerated through VT.
 #   Do NOT pass -c:v hevc_videotoolbox (that decoder does not exist).
 #
-# HDR tone-mapping:
-#   Preferred: zscale+tonemap chain (requires libzimg / zscale filter).
-#   Fallback:  scale+colorspace+tonemap chain (available in most ffmpeg builds).
-#              Slightly lower quality but functionally equivalent.
-#   Both chains convert BT.2020/PQ → BT.709 SDR and scale to 1920-wide
-#   (height calculated automatically to preserve source aspect ratio).
-#   VT cannot perform tone-mapping on-GPU, so decoded frames must be brought
-#   into CPU RAM. This is done implicitly via a format= filter (see below).
+# HDR tone-mapping — three tiers in descending preference:
+#
+#   Tier 1 — Full GPU (jellyfin-ffmpeg only):
+#     tonemap_videotoolbox: Metal compute shader, entire pipeline on GPU.
+#     Filter chain: hwupload,tonemap_videotoolbox,scale_vt=w=1920:h=-2
+#     Requires: jellyfin-ffmpeg with tonemap_videotoolbox filter.
+#
+#   Tier 2 — Hybrid GPU/CPU (evermeet.cx or jellyfin-ffmpeg):
+#     VT HW decode → implicit surface download → CPU zscale+tonemap → VT HW encode.
+#     Requires: zscale filter (libzimg). Standard Homebrew ffmpeg lacks this.
+#
+#   Tier 3 — Full software fallback:
+#     SW decode → CPU zscale+tonemap → libx264 encode.
+#     Used automatically if HW encode init fails.
 #
 # h264_videotoolbox encoder:
 #   -b:v sets the target bitrate (e.g. 8000k). No CRF equivalent in VT.
@@ -264,10 +334,10 @@ has_hdr() {
 # zscale (libzimg) is required — there is no viable fallback for HDR->SDR.
 #
 # Chain explanation:
-#   1. zscale=t=linear:npl=100:tin=smpte2084:min=bt2020nc:pin=bt2020
+#   1. zscale=t=linear:npl=<npl>:tin=smpte2084:min=bt2020nc:pin=bt2020
 #         - Declare input as PQ (smpte2084) / BT.2020 explicitly so zscale
 #           honours the metadata even if container tags are ambiguous
-#         - Convert transfer function to linear light (npl=100 = 100 nits SDR peak)
+#         - Convert to linear light; npl sets the SDR display peak in nits (-l flag)
 #   2. format=gbrpf32le
 #         - tonemap filter requires float RGB; convert from linear YUV to float RGB
 #   3. zscale=p=bt709
@@ -284,12 +354,55 @@ build_tonemap_vf() {
     # the -2 auto-height syntax needed to preserve non-2160 aspect ratios.
     local peak_opt=""
     [[ -n "$TONEMAP_PEAK" ]] && peak_opt=":peak=${TONEMAP_PEAK}"
-    echo "zscale=t=linear:npl=100:tin=smpte2084:min=bt2020nc:pin=bt2020,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=${TONEMAP}:desat=0${peak_opt},zscale=m=bt709:r=tv:t=bt709,scale=1920:-2:flags=lanczos,format=yuv420p"
+    echo "zscale=t=linear:npl=${TONEMAP_NPL}:tin=smpte2084:min=bt2020nc:pin=bt2020,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=${TONEMAP}:desat=0${peak_opt},zscale=m=bt709:r=tv:t=bt709,scale=1920:-2:flags=lanczos,format=yuv420p"
 }
 
 # Global command array — populated by build_*_cmd functions.
 # Bash 3.2 compatible: no negative indices, no unquoted command substitution.
 CMD_ARRAY=()
+
+build_hw_hdr_vt_cmd() {
+    # Full GPU pipeline using tonemap_videotoolbox (jellyfin-ffmpeg only).
+    # Frames stay on the GPU throughout: VT decode → Metal tonemap → VT scale → VT encode.
+    #
+    # Args: src dst out_w out_h
+    #   out_w / out_h are pre-calculated by the main loop (avoids a duplicate ffprobe).
+    #
+    # Pipeline notes:
+    #   - -hwaccel_output_format videotoolbox_vld keeps decoded frames on the GPU surface.
+    #   - No hwupload needed — frames are already on the VT surface after HW decode.
+    #   - tonemap_videotoolbox: Metal compute shader HDR→SDR.
+    #     format=nv12 sets output pixel format; p/t/m set target BT.709 colour space.
+    #   - scale_vt uses explicit pixel dimensions — it does not support auto-dimension
+    #     (0/-1 means "no change", not "derive proportionally").
+    #   - -pix_fmt is omitted — VT handles pixel format internally from the HW surface.
+    local src="$1" dst="$2" out_w="$3" out_h="$4"
+    local scale_arg="w=${out_w}:h=${out_h}"
+    CMD_ARRAY=(
+        "$FFMPEG_BIN" -hide_banner -loglevel warning -stats
+        -hwaccel videotoolbox
+        -hwaccel_output_format videotoolbox_vld
+        -probesize 100M
+        -analyzeduration 100M
+        -i "$src"
+        -map 0:v:0
+        -map 0:a
+        -map 0:s?
+        -map 0:d?
+        -vf "tonemap_videotoolbox=format=nv12:p=bt709:t=bt709:m=bt709,scale_vt=${scale_arg}:format=nv12"
+        -c:v h264_videotoolbox
+        -b:v "$VT_BITRATE"
+        -profile:v high
+        -allow_sw 1
+        -realtime 0
+        -color_primaries bt709
+        -color_trc bt709
+        -colorspace bt709
+        -c:a copy -c:s copy -c:d copy
+        -movflags +faststart
+        "$dst"
+    )
+}
 
 # Helper: last element without negative indexing (Bash 3.2 has no [-1])
 cmd_last() {
@@ -301,9 +414,10 @@ build_hw_sdr_cmd() {
     # -hwaccel videotoolbox enables HW decode; no explicit -c:v needed on input
     local src="$1" dst="$2"
     CMD_ARRAY=(
-        ffmpeg -hide_banner -loglevel warning -stats
+        "$FFMPEG_BIN" -hide_banner -loglevel warning -stats
         -hwaccel videotoolbox
         -probesize 100M
+        -analyzeduration 100M
         -i "$src"
         -map 0:v:0
         -map 0:a
@@ -342,9 +456,10 @@ build_hw_hdr_cmd() {
     # Prepending format=yuv420p would strip the HDR metadata and feed
     # gamma-encoded yuv420p into zscale, breaking tone-mapping.
     CMD_ARRAY=(
-        ffmpeg -hide_banner -loglevel warning -stats
+        "$FFMPEG_BIN" -hide_banner -loglevel warning -stats
         -hwaccel videotoolbox
         -probesize 100M
+        -analyzeduration 100M
         -i "$src"
         -map 0:v:0
         -map 0:a
@@ -370,8 +485,9 @@ build_sw_sdr_cmd() {
     # Software pipeline: SW decode -> CPU scale -> libx264 encode
     local src="$1" dst="$2"
     CMD_ARRAY=(
-        ffmpeg -hide_banner -loglevel warning -stats
+        "$FFMPEG_BIN" -hide_banner -loglevel warning -stats
         -probesize 100M
+        -analyzeduration 100M
         -i "$src"
         -map 0:v:0
         -map 0:a
@@ -398,8 +514,9 @@ build_sw_hdr_cmd() {
     local src="$1" dst="$2"
     local tonemap_vf="$(build_tonemap_vf)"
     CMD_ARRAY=(
-        ffmpeg -hide_banner -loglevel warning -stats
+        "$FFMPEG_BIN" -hide_banner -loglevel warning -stats
         -probesize 100M
+        -analyzeduration 100M
         -i "$src"
         -map 0:v:0
         -map 0:a
@@ -442,6 +559,12 @@ echo "║              Apple VideoToolbox Edition                  ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 echo -e "${RESET}"
 
+# Determine which ffmpeg binary is in use
+ffmpeg_src="$FFMPEG_BIN"
+if [[ "$FFMPEG_BIN" == *"jellyfin"* ]] || [[ "$FFMPEG_BIN" == *"Jellyfin"* ]]; then
+    ffmpeg_src="jellyfin-ffmpeg ($FFMPEG_BIN)"
+fi
+
 if $HW_DECODE_AVAILABLE; then
     hw_dec_label="VideoToolbox (-hwaccel videotoolbox)"
 else
@@ -454,12 +577,15 @@ else
     hw_enc_label="libx264 (crf=${SW_CRF})"
 fi
 
-if $ZSCALE_AVAILABLE; then
-    tonemap_label="${TONEMAP} via zscale"
+if $HW_TONEMAP_AVAILABLE; then
+    tonemap_label="${TONEMAP} via tonemap_videotoolbox (GPU/Metal)"
+elif $ZSCALE_AVAILABLE; then
+    tonemap_label="${TONEMAP} via zscale (CPU, npl=${TONEMAP_NPL})"
 else
-    tonemap_label="${TONEMAP} — zscale NOT AVAILABLE (HDR files will be skipped)"
+    tonemap_label="NOT AVAILABLE (HDR files will be skipped)"
 fi
 
+echo -e "  ffmpeg        : ${BOLD}${ffmpeg_src}${RESET}"
 echo -e "  Input         : ${BOLD}$INPUT${RESET}"
 echo -e "  Output dir    : ${BOLD}${OUTPUT_DIR:-<same as source>}${RESET}"
 echo -e "  HW decode     : ${BOLD}${hw_dec_label}${RESET}"
@@ -525,26 +651,56 @@ for src in "${mkv_files[@]}"; do
     # HDR detection
     if has_hdr "$src"; then
         hdr=true
-        # zscale is the only viable HDR->SDR path — abort this file if missing
-        if ! $ZSCALE_AVAILABLE; then
-            echo -e "  ${RED}ERROR${RESET} HDR source requires zscale (libzimg) for tone-mapping." >&2
-            echo -e "         Download the static build from: https://evermeet.cx/ffmpeg/" >&2
+        # Abort if no tone-mapping path is available at all
+        if ! $HW_TONEMAP_AVAILABLE && ! $ZSCALE_AVAILABLE; then
+            echo -e "  ${RED}ERROR${RESET} HDR source but no tone-mapping available." >&2
+            echo -e "         Install jellyfin-ffmpeg or the evermeet.cx static build." >&2
             ((errors++)) || true
             continue
         fi
-        echo -e "  ${CYAN}HDR detected${RESET} — hybrid: VT HW decode -> CPU tone-map (${TONEMAP}) -> VT HW encode"
+        if $HW_TONEMAP_AVAILABLE; then
+            echo -e "  ${CYAN}HDR detected${RESET} — full GPU: VT decode -> tonemap_videotoolbox (Metal) -> VT encode"
+        else
+            echo -e "  ${CYAN}HDR detected${RESET} — hybrid: VT decode -> CPU zscale+tonemap (${TONEMAP}) -> VT encode"
+        fi
     else
         hdr=false
         echo -e "  ${CYAN}SDR source${RESET} — full HW pipeline"
     fi
 
-    echo -e "  Output : $dst"
+    # Calculate output resolution — constrain source within 1920x1080 box.
+    # Used for logging and passed to build_hw_hdr_vt_cmd to avoid duplicate probing.
+    local_src_w=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=width -of default=noprint_wrappers=1:nokey=1 \
+        "$src" 2>/dev/null | tr -d '[:space:]')
+    local_src_h=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=height -of default=noprint_wrappers=1:nokey=1 \
+        "$src" 2>/dev/null | tr -d '[:space:]')
+    if [[ -n "$local_src_w" && -n "$local_src_h" && "$local_src_w" -gt 0 && "$local_src_h" -gt 0 ]]; then
+        if [[ "$((local_src_h * 1920))" -gt "$((local_src_w * 1080))" ]]; then
+            loop_out_h=1080
+            loop_out_w=$(( (local_src_w * 1080 / local_src_h + 1) / 2 * 2 ))
+        else
+            loop_out_w=1920
+            loop_out_h=$(( (local_src_h * 1920 / local_src_w + 1) / 2 * 2 ))
+        fi
+    else
+        loop_out_w=1920
+        loop_out_h=1080
+    fi
 
-    # Select pipeline
+    echo -e "  Source   : ${local_src_w}x${local_src_h}"
+    echo -e "  Output   : $dst"
+    echo -e "  Res out  : ${loop_out_w}x${loop_out_h}"
+
+    # Select pipeline — tier order: GPU tonemap > CPU tonemap > software
     if $HW_ENCODE_AVAILABLE; then
-        if $hdr; then
+        if $hdr && $HW_TONEMAP_AVAILABLE; then
+            build_hw_hdr_vt_cmd "$src" "$dst" "$loop_out_w" "$loop_out_h"
+            pipeline="GPU (VT decode + Metal tonemap_videotoolbox + VT encode)"
+        elif $hdr; then
             build_hw_hdr_cmd "$src" "$dst"
-            pipeline="HW-hybrid (VT decode + CPU tone-map + VT encode)"
+            pipeline="HW-hybrid (VT decode + CPU zscale+tonemap + VT encode)"
         else
             build_hw_sdr_cmd "$src" "$dst"
             pipeline="HW (full VideoToolbox)"
@@ -552,7 +708,7 @@ for src in "${mkv_files[@]}"; do
     else
         if $hdr; then
             build_sw_hdr_cmd "$src" "$dst"
-            pipeline="SW (libx264 + CPU tone-map)"
+            pipeline="SW (libx264 + CPU zscale+tonemap)"
         else
             build_sw_sdr_cmd "$src" "$dst"
             pipeline="SW (libx264)"
@@ -582,6 +738,11 @@ for src in "${mkv_files[@]}"; do
                 build_sw_hdr_cmd "$src" "$dst"
             else
                 build_sw_sdr_cmd "$src" "$dst"
+            fi
+            # If GPU tonemap failed, also disable it for subsequent files
+            if $HW_TONEMAP_AVAILABLE; then
+                echo -e "  ${YELLOW}Disabling tonemap_videotoolbox for remaining files.${RESET}"
+                HW_TONEMAP_AVAILABLE=false
             fi
             if run_cmd; then
                 echo -e "  ${GREEN}Done${RESET} [SW fallback]"

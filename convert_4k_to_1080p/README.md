@@ -1,68 +1,73 @@
 # convert_4k_to_1080p.sh
 
-Recursively scans a directory for 4K UHD HEVC (H.265) MKV files and
-converts them to 1080p HD AVC (H.264) MKV files with HDR→SDR tone mapping.
-Audio and subtitle tracks are copied without modification.
+Recursively scans a directory for 4K UHD HEVC (H.265) MKV files and converts them to 1080p HD AVC (H.264) MKV files with HDR→SDR tone mapping. Audio and subtitle tracks are copied without modification.
 
-Hardware acceleration: Apple VideoToolbox (macOS) is used by default for
-both decoding (hevc_videotoolbox) and encoding (h264_videotoolbox).
-HDR tone-mapping is performed in software (CPU) as VideoToolbox does not
-support it natively; the script automatically uses a hybrid pipeline
-(HW decode → CPU tone-map/scale → HW encode) for HDR sources and a
-fully hardware pipeline for SDR sources.
-Falls back to software (libx264) automatically if VideoToolbox is
-unavailable or fails to initialise for a given file.
+Hardware acceleration: Apple VideoToolbox (macOS) is used for all pipelines. The script automatically selects the best available tier at startup:
+
+Tier 1 - Full GPU (`jellyfin-ffmpeg` required):
+  All processing stays on the GPU. HEVC decoded via VideoToolbox, HDR->SDR tone-mapping performed by `tonemap_videotoolbox` (Apple Metal compute shaders), scaled via `scale_vt`, and encoded by `h264_videotoolbox`.
+
+Tier 2 - Hybrid GPU/CPU (evermeet.cx static `ffmpeg` or `jellyfin-ffmpeg`):
+  VideoToolbox HW decode and encode, with CPU-side HDR->SDR tone-mapping via zscale + tonemap (libzimg). Frames are transferred from GPU to CPU for tone-mapping then back to GPU for encoding.
+
+Tier 3 - Software fallback (automatic):
+  Used if VideoToolbox fails to initialise for a given file. Full software pipeline using libx264 with CPU zscale+tonemap tone-mapping.
 
 ## Requirements:
-  - ffmpeg + ffprobe: static builds from https://evermeet.cx/ffmpeg/
-    These include VideoToolbox, libx264, libzimg (zscale), and all
-    required filters. The standard Homebrew ffmpeg does NOT include
-    libzimg/zscale and will not work for HDR tone-mapping.
-     Install:
+ffmpeg + ffprobe — the script checks for binaries in this priority order:
+1. `jellyfin-ffmpeg` (preferred — enables full GPU tone-mapping via `tonemap_videotoolbox` / Metal, which standard `ffmpeg` builds lack):
+  - `/usr/lib/jellyfin-ffmpeg/ffmpeg`
+  - `/Applications/Jellyfin.app/Contents/MacOS/ffmpeg`
 
-      `curl -L https://evermeet.cx/ffmpeg/get/zip -o ffmpeg.zip && unzip ffmpeg.zip`
+Install: https://github.com/jellyfin/jellyfin-ffmpeg/releases
 
-      `curl -L https://evermeet.cx/ffmpeg/get/ffprobe/zip -o ffprobe.zip && unzip ffprobe.zip`
+2. evermeet.cx static build (fallback — CPU tone-mapping via `zscale`, HW encode/decode still active via VideoToolbox):
+  https://evermeet.cx/ffmpeg/
+  - `curl -L https://evermeet.cx/ffmpeg/get/zip -o ffmpeg.zip && unzip ffmpeg.zip`
+  - `curl -L https://evermeet.cx/ffmpeg/get/ffprobe/zip -o ffprobe.zip && unzip ffprobe.zip`
+  - `sudo mv ffmpeg ffprobe /usr/local/bin/`
+  - `sudo xattr -d com.apple.quarantine /usr/local/bin/ffmpeg /usr/local/bin/ffprobe`
 
-      `sudo mv ffmpeg ffprobe /usr/local/bin/`
+The standard Homebrew `ffmpeg` lacks both `tonemap_videotoolbox` and `zscale` and will not work for HDR tone-mapping.
 
-      `sudo xattr -d com.apple.quarantine /usr/local/bin/ffmpeg /usr/local/bin/ffprobe`
-
-  - macOS 10.13+ (VideoToolbox HEVC decode requires Metal/macOS 10.13+)
+- macOS 10.13+ (VideoToolbox HEVC decode requires Metal/macOS 10.13+)
 
 ## Usage:
-  `./convert_4k_to_1080p.sh [OPTIONS] <input>`
+`./convert_4k_to_1080p.sh [OPTIONS] <input>`
 
-  - `<input>` can be:
-    - A directory: recursively scanned for 4K HEVC MKV files
-    - A single MKV file: converted directly (must be 4K HEVC)
+`<input>` can be:
+- A directory: recursively scanned for 4K HEVC MKV files
+- A single MKV file: converted directly (must be 4K HEVC)
 
- ## Options:
-  `-o <dir>`    Output directory for converted files
-              (default: same directory as each source file)
-              Output filename is always "`<original name> - 1080p.mkv`"
-  
-  `-b <rate>`   VideoToolbox encode bitrate (default: 8000k)
-              Examples: 6000k, 8000k, 12000k. Ignored in SW mode.
-  
-  `-c <val>`    Software fallback CRF 0-51 (default: 18, lower=better)
-  
-  `-p <preset>` Software fallback x264 preset (default: slow)
-  
-  `-t <method>` Tone-mapping algorithm (default: mobius)
-              Options: hable mobius reinhard clip linear gamma none
-              Note: bt2390 is only valid for the libplacebo-based
-              tonemap2 filter, not the tonemap filter used by this script
-  
-  `-k <val>`    Peak brightness for tone-mapping in nits (default: omitted,
-              letting ffmpeg auto-detect from source metadata)
-              Example: -k 1000 for a 1000-nit mastered source
-  
-  `-s`          Force software encode only (skip VideoToolbox entirely)
-  
-  `-n`          Dry-run: detect files and print commands without converting
-  
-  `-h`          Show this help message
+Options:
+- `-o <dir>`
+  - Output directory for converted files
+  - (default: same directory as each source file)
+  - Output filename is always `<original name> - 1080p.mkv`
+- `-b <rate>`
+  - VideoToolbox encode bitrate (default: `8000k`)
+  - Examples: `6000k`, `8000k`, `12000k`. Ignored in SW mode.
+- `-c <val>`
+  - Software fallback CRF 0-51 (default: `18`, lower=better)
+- `-p <preset>`
+  - Software fallback x264 preset (default: `slow`)
+- `-t <method>`
+  - Tone-mapping algorithm (default: `mobius`)
+  - Options: `hable` `mobius` `reinhard` `clip` `linear` `gamma` `none`
+  - Note: bt2390 is only valid for the libplacebo-based tonemap2 filter, not the tonemap filter used by this script
+- `-k <val>`
+  - Peak brightness for tone-mapping in nits (default: omitted, letting ffmpeg auto-detect from source metadata)
+  - Example: `-k 1000` for a 1000-nit mastered source
+- `-l <nits>`
+  - Nominal peak luminance of the SDR output display in nits
+  - (default: `100`). Raise this if the output appears overbright; values of 150-250 suit most modern displays. Higher values give the tone-mapper more headroom, reducing highlight clipping.
+  - Example: `-l 203` (reference white for HDR displays)
+- `-s`
+  - Force software encode only (skip VideoToolbox entirely)
+- `-n`
+  - Dry-run: detect files and print commands without converting
+- `-h`
+  - Show this help message
 
 ## Examples:
   `./convert_4k_to_1080p.sh /Volumes/NAS/Movies`
