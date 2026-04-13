@@ -12,7 +12,14 @@ See the individual script's README files for details.
   - Ensures the Dolby Vision profile is Profile 8.1.
   - Converts a HDR10+ base layer to regular HDR10 (as per standard)
   - **Useful for ensuring compatibility with touchy devices like LG webOS TVs.**
-- **remove_non_english_subs.sh**
+- **mkv_original_english_audio_subtitle_tracks.sh**
+  - Scans a directory (or a single file) for MKV video files
+  - Looks up the content's original language on TMDB using either an IMDB or TVDB ID present in the filename/directory name.
+  - Removes all audio tracks that are not the original language or English. (leaves undetermined/unknown tracks untouched)
+  - Removes all subtitle tracks that are not English (leaves undetermined/unknown tracks untouched)
+  - **Useful for tidying up media libraries and saving a little bit of storage space.**
+- **~~remove_non_english_subs.sh~~**
+  - **DEPRECATED and replaced with mkv_original_english_audio_subtitle_tracks.sh**
   - Scans a directory (or a single file) for MKV video files
   - Removes all subtitle tracks that are not tagged as English (leaves undetermined/unknown tracks untouched)
   - **Useful for tidying up media libraries and saving a little bit of storage space.**
