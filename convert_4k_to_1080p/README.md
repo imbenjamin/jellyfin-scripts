@@ -2,16 +2,22 @@
 
 Recursively scans a directory for 4K UHD HEVC (H.265) MKV files and converts them to 1080p HD AVC (H.264) MKV files with HDR→SDR tone mapping. Audio and subtitle tracks are copied without modification.
 
-Hardware acceleration: Apple VideoToolbox (macOS) is used for all pipelines. The script automatically selects the best available tier at startup:
+Hardware acceleration: Apple VideoToolbox (macOS) is used for all pipelines.
+The script automatically selects the best available tier at startup and retries per-file — Tier 1 is attempted for every HDR file independently.
 
-Tier 1 - Full GPU (`jellyfin-ffmpeg` required):
-  All processing stays on the GPU. HEVC decoded via VideoToolbox, HDR->SDR tone-mapping performed by `tonemap_videotoolbox` (Apple Metal compute shaders), scaled via `scale_vt`, and encoded by `h264_videotoolbox`.
+- Tier 1 - Full GPU (jellyfin-ffmpeg required):
+  - Entire HDR pipeline stays on GPU. Filter chain (modelled on Jellyfin's own ffmpeg command for VideoToolbox HDR transcoding):
+    - `scale_vt`: GPU resize to target resolution (keeps VT surface format)
+    - `tonemap_videotoolbox`: Apple Metal compute shader HDR->SDR (bt2390)
+    - `h264_videotoolbox`: GPU encode, receives VT surface directly
+  - Requires: `-init_hw_device videotoolbox=vt`, `-noautoscale`.
+  - Falls back to Tier 2 automatically per-file on failure.
 
-Tier 2 - Hybrid GPU/CPU (evermeet.cx static `ffmpeg` or `jellyfin-ffmpeg`):
-  VideoToolbox HW decode and encode, with CPU-side HDR->SDR tone-mapping via zscale + tonemap (libzimg). Frames are transferred from GPU to CPU for tone-mapping then back to GPU for encoding.
+- Tier 2 - Hybrid GPU/CPU (evermeet.cx static ffmpeg or jellyfin-ffmpeg):
+  - VideoToolbox HW decode and encode, with CPU-side HDR->SDR tone-mapping via zscale + tonemap (`libzimg`). Used when Tier 1 is unavailable or fails for a specific file. Tonemap algorithm controlled by `-t` flag.
 
-Tier 3 - Software fallback (automatic):
-  Used if VideoToolbox fails to initialise for a given file. Full software pipeline using libx264 with CPU zscale+tonemap tone-mapping.
+- Tier 3 - Software fallback (automatic):
+  - Used if VideoToolbox encode fails. Full software pipeline using libx264 with CPU zscale+tonemap tone-mapping.
 
 ## Requirements:
 ffmpeg + ffprobe — the script checks for binaries in this priority order:

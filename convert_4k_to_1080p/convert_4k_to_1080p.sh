@@ -7,21 +7,26 @@
 # Audio and subtitle tracks are copied without modification.
 #
 # Hardware acceleration: Apple VideoToolbox (macOS) is used for all pipelines.
-# The script automatically selects the best available tier at startup:
+# The script automatically selects the best available tier at startup and
+# retries per-file — Tier 1 is attempted for every HDR file independently.
 #
 #   Tier 1 - Full GPU (jellyfin-ffmpeg required):
-#     All processing stays on the GPU. HEVC decoded via VideoToolbox, HDR->SDR
-#     tone-mapping performed by tonemap_videotoolbox (Apple Metal compute
-#     shaders), scaled via scale_vt, and encoded by h264_videotoolbox.
+#     Entire HDR pipeline stays on GPU. Filter chain (modelled on Jellyfin's
+#     own ffmpeg command for VideoToolbox HDR transcoding):
+#       scale_vt: GPU resize to target resolution (keeps VT surface format)
+#       tonemap_videotoolbox: Apple Metal compute shader HDR->SDR (bt2390)
+#       h264_videotoolbox: GPU encode, receives VT surface directly
+#     Requires: -init_hw_device videotoolbox=vt, -noautoscale.
+#     Falls back to Tier 2 automatically per-file on failure.
 #
 #   Tier 2 - Hybrid GPU/CPU (evermeet.cx static ffmpeg or jellyfin-ffmpeg):
 #     VideoToolbox HW decode and encode, with CPU-side HDR->SDR tone-mapping
-#     via zscale + tonemap (libzimg). Frames are transferred from GPU to CPU
-#     for tone-mapping then back to GPU for encoding.
+#     via zscale + tonemap (libzimg). Used when Tier 1 is unavailable or
+#     fails for a specific file. Tonemap algorithm controlled by -t flag.
 #
 #   Tier 3 - Software fallback (automatic):
-#     Used if VideoToolbox fails to initialise for a given file. Full software
-#     pipeline using libx264 with CPU zscale+tonemap tone-mapping.
+#     Used if VideoToolbox encode fails. Full software pipeline using libx264
+#     with CPU zscale+tonemap tone-mapping.
 #
 # Requirements:
 #   ffmpeg + ffprobe — the script checks for binaries in this priority order:
@@ -60,10 +65,11 @@
 #               Examples: 6000k, 8000k, 12000k. Ignored in SW mode.
 #   -c <val>    Software fallback CRF 0-51 (default: 18, lower=better)
 #   -p <preset> Software fallback x264 preset (default: slow)
-#   -t <method> Tone-mapping algorithm (default: mobius)
+#   -t <method> Tone-mapping algorithm for CPU hybrid pipeline (default: mobius)
 #               Options: hable mobius reinhard clip linear gamma none
-#               Note: bt2390 is only valid for the libplacebo-based
-#               tonemap2 filter, not the tonemap filter used by this script
+#               Note: the GPU pipeline (Tier 1) always uses bt2390, which is
+#               Jellyfin's confirmed default for tonemap_videotoolbox. The -t
+#               flag only affects the CPU zscale+tonemap fallback (Tier 2/3).
 #   -k <val>    Peak brightness for tone-mapping in nits (default: omitted,
 #               letting ffmpeg auto-detect from source metadata)
 #               Example: -k 1000 for a 1000-nit mastered source
@@ -219,7 +225,8 @@ if ! $FORCE_SW; then
     if "$FFMPEG_BIN" -hide_banner -encoders 2>/dev/null | grep -q "h264_videotoolbox"; then
         HW_ENCODE_AVAILABLE=true
     fi
-    # Probe tonemap_videotoolbox (Metal GPU tone-mapping, jellyfin-ffmpeg only)
+    # Probe tonemap_videotoolbox (Metal GPU tone-mapping, jellyfin-ffmpeg only).
+    # Used as Tier 1 for HDR sources; falls back per-file to Tier 2 on failure.
     if "$FFMPEG_BIN" -hide_banner -filters 2>/dev/null | grep -qF "tonemap_videotoolbox"; then
         HW_TONEMAP_AVAILABLE=true
     fi
@@ -306,24 +313,51 @@ has_hdr() {
 # ── Pipeline strategy ─────────────────────────────────────────────────────────
 #
 # VideoToolbox HW decode:
-#   Enabled via -hwaccel videotoolbox on the input. No separate decoder name
-#   is needed — the standard hevc decoder runs accelerated through VT.
+#   Enabled via -hwaccel videotoolbox + -hwaccel_output_format videotoolbox_vld.
+#   The standard hevc decoder runs hardware-accelerated through VT.
 #   Do NOT pass -c:v hevc_videotoolbox (that decoder does not exist).
 #
-# HDR tone-mapping — three tiers in descending preference:
+# Tier 1 — Full GPU HDR pipeline (jellyfin-ffmpeg + tonemap_videotoolbox):
 #
-#   Tier 1 — Full GPU (jellyfin-ffmpeg only):
-#     tonemap_videotoolbox: Metal compute shader, entire pipeline on GPU.
-#     Filter chain: hwupload,tonemap_videotoolbox,scale_vt=w=1920:h=-2
-#     Requires: jellyfin-ffmpeg with tonemap_videotoolbox filter.
+#   Derived from the exact ffmpeg command Jellyfin generates for VideoToolbox
+#   HDR transcoding on macOS. Key requirements discovered through testing:
 #
-#   Tier 2 — Hybrid GPU/CPU (evermeet.cx or jellyfin-ffmpeg):
-#     VT HW decode → implicit surface download → CPU zscale+tonemap → VT HW encode.
-#     Requires: zscale filter (libzimg). Standard Homebrew ffmpeg lacks this.
+#   -init_hw_device videotoolbox=vt
+#     Must be passed before -hwaccel. Explicitly names the VT Metal device
+#     context that tonemap_videotoolbox uses. Without this, the filter cannot
+#     initialise its Metal compute pipeline.
 #
-#   Tier 3 — Full software fallback:
-#     SW decode → CPU zscale+tonemap → libx264 encode.
-#     Used automatically if HW encode init fails.
+#   -noautoscale  (placed after -i, as an output option)
+#     Prevents ffmpeg from inserting its automatic "auto_scale_0" format
+#     conversion filter between the last VF filter and the encoder. Without
+#     this, ffmpeg inserts a converter that fails with "Impossible to convert
+#     between formats" because it cannot bridge VT surface → encoder formats.
+#
+#   Filter chain:  scale_vt=W:H  →  tonemap_videotoolbox=...  →  h264_videotoolbox
+#
+#   scale_vt=W:H
+#     GPU resize to target resolution. No format= option — keeps the frame
+#     as a native VT hardware surface (videotoolbox_vld) for tonemap input.
+#
+#   tonemap_videotoolbox=p=bt709:t=bt709:m=bt709:tonemap=bt2390:peak=100:desat=0
+#     Metal compute shader: HDR→SDR on GPU. No format= option — outputs a
+#     native VT surface that h264_videotoolbox can consume directly without
+#     any format negotiation. Adding format=nv12 here causes auto_scale_0
+#     failures because it converts to software frames the encoder rejects.
+#     bt2390 is Jellyfin's confirmed algorithm for this filter; peak=100 and
+#     desat=0 are Jellyfin's confirmed defaults.
+#
+#   h264_videotoolbox
+#     Receives a native VT surface from tonemap_videotoolbox. No -pix_fmt
+#     needed — format negotiation happens natively within the VT context.
+#
+# Tier 2 — Hybrid GPU/CPU HDR pipeline:
+#   VT HW decode → implicit surface download → CPU zscale+tonemap → VT HW encode.
+#   Used when Tier 1 fails for a specific file. Tonemap algorithm from -t flag.
+#
+# Tier 3 — Software fallback:
+#   SW decode → CPU zscale+tonemap → libx264 encode.
+#   Used when VT encode init fails.
 #
 # h264_videotoolbox encoder:
 #   -b:v sets the target bitrate (e.g. 8000k). No CRF equivalent in VT.
@@ -362,34 +396,25 @@ build_tonemap_vf() {
 CMD_ARRAY=()
 
 build_hw_hdr_vt_cmd() {
-    # Full GPU pipeline using tonemap_videotoolbox (jellyfin-ffmpeg only).
-    # Frames stay on the GPU throughout: VT decode → Metal tonemap → VT scale → VT encode.
-    #
-    # Args: src dst out_w out_h
-    #   out_w / out_h are pre-calculated by the main loop (avoids a duplicate ffprobe).
-    #
-    # Pipeline notes:
-    #   - -hwaccel_output_format videotoolbox_vld keeps decoded frames on the GPU surface.
-    #   - No hwupload needed — frames are already on the VT surface after HW decode.
-    #   - tonemap_videotoolbox: Metal compute shader HDR→SDR.
-    #     format=nv12 sets output pixel format; p/t/m set target BT.709 colour space.
-    #   - scale_vt uses explicit pixel dimensions — it does not support auto-dimension
-    #     (0/-1 means "no change", not "derive proportionally").
-    #   - -pix_fmt is omitted — VT handles pixel format internally from the HW surface.
+    # Tier 1: Full GPU HDR pipeline using tonemap_videotoolbox (jellyfin-ffmpeg only).
+    # See the pipeline strategy comment above for full design rationale.
+    # Args: src dst out_w out_h (output dimensions pre-calculated in main loop)
     local src="$1" dst="$2" out_w="$3" out_h="$4"
-    local scale_arg="w=${out_w}:h=${out_h}"
     CMD_ARRAY=(
+
         "$FFMPEG_BIN" -hide_banner -loglevel warning -stats
+        -analyzeduration 200M
+        -probesize 1G
+        -init_hw_device videotoolbox=vt
         -hwaccel videotoolbox
         -hwaccel_output_format videotoolbox_vld
-        -probesize 100M
-        -analyzeduration 100M
         -i "$src"
+        -noautoscale
         -map 0:v:0
         -map 0:a
         -map 0:s?
         -map 0:d?
-        -vf "tonemap_videotoolbox=format=nv12:p=bt709:t=bt709:m=bt709,scale_vt=${scale_arg}:format=nv12"
+        -vf "scale_vt=${out_w}:${out_h},tonemap_videotoolbox=p=bt709:t=bt709:m=bt709:tonemap=bt2390:peak=100:desat=0"
         -c:v h264_videotoolbox
         -b:v "$VT_BITRATE"
         -profile:v high
@@ -578,9 +603,9 @@ else
 fi
 
 if $HW_TONEMAP_AVAILABLE; then
-    tonemap_label="${TONEMAP} via tonemap_videotoolbox (GPU/Metal)"
+    tonemap_label="${TONEMAP} via tonemap_videotoolbox (GPU/Metal, falls back per-file)"
 elif $ZSCALE_AVAILABLE; then
-    tonemap_label="${TONEMAP} via zscale (CPU, npl=${TONEMAP_NPL})"
+    tonemap_label="${TONEMAP} via zscale (CPU hybrid, npl=${TONEMAP_NPL})"
 else
     tonemap_label="NOT AVAILABLE (HDR files will be skipped)"
 fi
@@ -659,7 +684,7 @@ for src in "${mkv_files[@]}"; do
             continue
         fi
         if $HW_TONEMAP_AVAILABLE; then
-            echo -e "  ${CYAN}HDR detected${RESET} — full GPU: VT decode -> tonemap_videotoolbox (Metal) -> VT encode"
+            echo -e "  ${CYAN}HDR detected${RESET} — attempting GPU: VT decode -> tonemap_videotoolbox (Metal) -> VT encode"
         else
             echo -e "  ${CYAN}HDR detected${RESET} — hybrid: VT decode -> CPU zscale+tonemap (${TONEMAP}) -> VT encode"
         fi
@@ -731,25 +756,33 @@ for src in "${mkv_files[@]}"; do
         echo -e "  ${GREEN}Done${RESET} [${pipeline}]"
         ((converted++)) || true
     else
-        # Retry with SW fallback if HW pipeline was used
+        # Retry with SW fallback if HW pipeline was used.
+        # If GPU tonemapping failed, retry this file with CPU zscale+tonemap,
+        # but restore HW_TONEMAP_AVAILABLE=true so the NEXT file tries GPU again.
         if $HW_ENCODE_AVAILABLE; then
             echo -e "  ${YELLOW}HW pipeline failed — retrying with software fallback...${RESET}"
+            local_hw_tonemap_was_tried=false
+            if $hdr && $HW_TONEMAP_AVAILABLE; then
+                local_hw_tonemap_was_tried=true
+                HW_TONEMAP_AVAILABLE=false
+            fi
             if $hdr; then
                 build_sw_hdr_cmd "$src" "$dst"
             else
                 build_sw_sdr_cmd "$src" "$dst"
             fi
             # If GPU tonemap failed, also disable it for subsequent files
-            if $HW_TONEMAP_AVAILABLE; then
-                echo -e "  ${YELLOW}Disabling tonemap_videotoolbox for remaining files.${RESET}"
-                HW_TONEMAP_AVAILABLE=false
-            fi
+
             if run_cmd; then
                 echo -e "  ${GREEN}Done${RESET} [SW fallback]"
                 ((converted++)) || true
             else
                 echo -e "  ${RED}Software fallback also failed: $src${RESET}" >&2
                 ((errors++)) || true
+            fi
+            # Restore GPU tonemap for next file — failure was per-file, not permanent
+            if $local_hw_tonemap_was_tried; then
+                HW_TONEMAP_AVAILABLE=true
             fi
         else
             echo -e "  ${RED}FFmpeg failed for: $src${RESET}" >&2
